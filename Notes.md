@@ -61,8 +61,9 @@ Nemotron 3 Nano 30B-A3B is a **Mixture-of-Experts (MoE) hybrid Mamba-Transformer
 ### Implication for LoRA Target Selection
 | Layer Group | Count | LoRA Suitability | Rationale |
 |---|---|---|---|
-| **attention** (self_attn) | ~6 layers | ✅ Good | Always active, high-information bottleneck |
-| **mamba** (mixer) | ~46 layers | ✅ Good | Always active, core sequence modeling |
+| **attention** (self_attn) | ~6 layers | ✅ Best | Most quantization-sensitive; always active, high-information bottleneck |
+| **mamba (pre-attn)** | ~6 layers | ✅ Best | Quantization-sensitive; feed into attention — highest impact Mamba layers |
+| **mamba (remaining)** | ~40 layers | ⚠️ Low ROI | Quantization-robust — model tolerates weight perturbations here. LoRA budget better spent elsewhere |
 | **shared_expert** | ~2 per layer | ✅ Good | Always active, see all tokens |
 | **routable_expert** | 128 per layer | ❌ Poor | Only 6/128 active → sparse gradient signal, huge param count |
 | **router/gate** | Per layer | ❌ Avoid | Frozen during NVIDIA's RL; modifying may destabilize routing |
@@ -109,11 +110,28 @@ Nemotron 3 Nano 30B-A3B is a **Mixture-of-Experts (MoE) hybrid Mamba-Transformer
 
 ---
 
-## 4. Quantization Notes
+## 4. Quantization & Layer Sensitivity (§4.2 — Critical for LoRA Targeting)
 
 - FP8 post-training quantization achieves ~99% median accuracy recovery
-- Self-attention layers (6/52) and preceding Mamba layers most sensitive → kept in BF16
 - KV cache quantized to FP8 enables larger batch sizes
+
+### NVIDIA's Quantization Sensitivity Analysis (Directly Informs LoRA)
+NVIDIA performed **quantization sensitivity analysis** across all 52 layers:
+- **Self-attention layers (6/52)** are the **most sensitive** components → kept in BF16
+- **The 6 Mamba layers that feed into self-attention layers** were also found sensitive → kept in BF16
+- The remaining **40 Mamba layers** can be aggressively quantized with minimal accuracy loss
+- Conv1D within Mamba layers kept in BF16
+
+> "Keeping the 6 self-attention layers and the 6 Mamba layers in BF16 provided a sweet-spot configuration for accuracy recovery and efficiency trade-off."
+
+### Implication for LoRA
+If a layer is sensitive to quantization, it means small weight perturbations there have outsized effects on model quality. This suggests:
+- **High-ROI LoRA targets**: The 12 sensitive layers (6 attention + 6 pre-attention Mamba) — perturbations here have the most impact
+- **Low-ROI LoRA targets**: The 40 "quantization-safe" Mamba layers — the model is robust to changes in these weights
+- **Shared experts**: Always active (2 per layer, all 52 layers) — the paper doesn't call these out as quantization-sensitive, but they're always in the forward pass
+
+### Identifying the 12 Sensitive Layers
+The 52 layers follow a repeating pattern (from Figure 2): Mamba layers interleaved with 6 attention layers. The "Mamba layers that feed into self-attention layers" are the Mamba layers immediately preceding each attention layer. To identify them, inspect the model's layer pattern or check which layer indices contain `self_attn` modules.
 
 ---
 
@@ -177,5 +195,96 @@ Nemotron 3 Nano 30B-A3B is a **Mixture-of-Experts (MoE) hybrid Mamba-Transformer
 - **Layer selection refinement**: NVIDIA froze routers and excluded routable experts — our Optuna search confirms this approach
 - **Learning rate schedule**: Cosine with warmup (currently used) matches NVIDIA's recipe
 - **Prompt sensitivity**: NVIDIA found Nemotron 3 Nano has low prompt sensitivity (std < 1 across benchmarks) — prompt engineering may have diminishing returns vs. data quality
-- **RLVR**: If compute allows, RL with verifiable rewards on puzzle tasks could significantly outperform SFT alone (NVIDIA showed RLVR surpassed heavily fine-tuned SFT)
+- **RLVR/GRPO**: RL with verifiable rewards could significantly outperform SFT alone (NVIDIA showed RLVR surpassed heavily fine-tuned SFT). We already have deterministic solvers for 4/6 puzzle types that could serve as reward verifiers. See §8 below.
 - **DPO**: Even minimal DPO (50 steps, 10k samples) gave meaningful accuracy improvements — could be a cheap add-on after SFT
+
+---
+
+## 8. SFT vs RL & the GRPO/RLVR Path
+
+> Source: [Unsloth × NVIDIA — What are RL environments and how to build them (Mar 2026)](https://unsloth.ai/blog/rl-environments)
+
+### When SFT Falls Short
+- **Imitation over adaptivity**: With small datasets, models learn to mimic the answer rather than learn the process to get there.
+- **Brittleness**: SFT models struggle when scenarios fall outside training distribution — needs diverse, large datasets.
+- RL becomes the better choice as complexity grows: instead of "say exactly this," you provide a goal + verification, so the model explores reasoning paths and becomes resilient to edge cases.
+
+### Recommended Hybrid Strategy
+1. **SFT for warm-starting RL** — teach chat template, `\boxed{}` format, general readability. Prevents RL from wasting time learning format.
+2. **RL for scaling** — allow model to explore and self-correct. This is where reasoning and robustness are forged.
+
+> "The NVIDIA Nemotron 3 family utilizes SFT as a substantial first stage to ground the model before moving into RL refinement."
+
+### GRPO (Group Relative Policy Optimization)
+- Optimized version of PPO: replaces heavy critic/reward models by generating **groups of outputs** and scoring them against a **deterministic verifier**.
+- **Reward type**: Typically binary (0 or 1), but supports continuous values. Thrives when environment can programmatically say "Yes" or "No."
+- **Efficiency**: Eliminating value model + reward model from PPO significantly reduces memory overhead — key factor in scaling reasoning.
+- Available in: **TRL** (already in our stack), **Unsloth**, **NeMo RL**.
+
+### RLVR (RL from Verifiable Rewards)
+- Central paradigm shift: replace subjective scoring with **explicit deterministic checks** (correct answer? right tool call?).
+- The **environment** becomes the contract between learning and behavior.
+- GRPO provides the optimization mechanism; the verifier defines "what good looks like."
+
+### Verification Best Practices
+- **Prefer binary rewards**: Strict success/failure signals yield the most stable optimization for GRPO. Partial credit sounds intuitive but hurts training stability.
+- **Profile reward signals before training**: Run rollouts across models of varying capabilities. If a frontier model can't consistently outscore the base model, the verifier or task definitions need recalibration.
+- **State matching > trajectory matching**: Check final outcome regardless of how agent got there (more robust than comparing against a "golden path").
+
+### Applicability to This Competition
+We already have deterministic solvers for 4/6 puzzle types (gravity, unit conversion, base conversion, text encryption). These could serve as binary GRPO verifiers:
+- Generate N candidate answers per puzzle → solver checks if answer is correct → reward 0 or 1
+- Remaining 2 types (equation transformation, bit manipulation) would need `\boxed{}` string-match against known answer as verifier
+- **Blocker**: Competition only accepts LoRA adapter (rank ≤ 32), inference is greedy vLLM — no tool-calling at eval. GRPO would teach the model the reasoning process itself.
+- **Compute concern**: GRPO needs many generations per prompt (NVIDIA used 16). Feasible on Kaggle with small batch + gradient accumulation, but slower than pure SFT.
+
+### Relevant Tools & Links
+- [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) — RL environment framework (builds verifiable environments)
+- [NeMo RL](https://github.com/NVIDIA-NeMo/RL) — RL training framework
+- [NeMo Data Designer](https://github.com/NVIDIA-NeMo/DataDesigner) — synthetic data generation
+- [Unsloth GRPO + NeMo Gym tutorial](https://unsloth.ai/docs/models/tutorials/nemotron-3#reinforcement-learning--nemo-gym) — Sudoku + multi-environment training
+- [TRL GRPOTrainer](https://huggingface.co/docs/trl/main/en/grpo_trainer) — GRPO in TRL (already in our pip install)
+
+---
+
+## 9. GRPO Research Findings (from link deep-dive)
+
+### Root Cause of reward=0 / loss=0
+**`max_completion_length=256` was too short.** Nemotron 3 prepends `<think>` reasoning (token IDs 12/13) before the answer. At temp=0.7, completions are truncated before `\boxed{}` is reached. When all completions in a group get reward=0, advantage=0 for all, so loss=0. Fixed to 512.
+
+### TRL GRPOTrainer — Key Facts
+- **Dataset format**: Conversational format (list of message dicts) → `completions` passed to reward func are also lists of message dicts. Our reward function handles this with `isinstance(completion, list)` check.
+- **Reward function interface**: Must accept `prompts`, `completions`, `completion_ids`, `trainer_state`, `log_extra`, `log_metric`, plus any dataset column names via `**kwargs`. Must return `list[float]`.
+- **Effective batch must be divisible by `num_generations`**: `num_processes * per_device_batch_size * gradient_accumulation_steps` ÷ `num_generations`.
+- **`loss_type="dapo"` (default)**: Normalizes by active token count, no length bias. Good for long CoT.
+- **`mask_truncated_completions=True`**: Excludes truncated completions from loss. DAPO paper says this is good practice.
+- **`scale_rewards`**: Default is `"group"` (std within group). Dr. GRPO paper says `False` avoids difficulty bias. `"batch"` (PPO Lite) is another option.
+- **`beta=0.0` (default)**: No KL penalty, no reference model loaded. Saves ~50% memory. Standard practice post-DeepSeek-R1.
+- **Logged metrics to watch**: `completions/clipped_ratio` (truncation), `frac_reward_zero_std` (diversity), `reward` (learning signal), `completions/mean_length`.
+
+### NeMo Gym Notebook Reference Settings (Sudoku + Multi-Env)
+- `temperature = 1.0` (not 0.7) — more exploration
+- `learning_rate = 1e-5` (we use 5e-6 — more conservative, fine for warm-started model)
+- `num_generations = 8` (we use 4 — memory constrained)
+- `gradient_accumulation_steps = 64` (much higher — they use H100 full finetuning)
+- `max_completion_length = max_seq_length - max_prompt_length` (dynamic, not fixed 256)
+- `per_device_train_batch_size = 1`
+- **100 steps** was enough to see significant improvement (reward 0.15 → 0.6 for sudoku)
+
+### Unsloth RL Blog — Key Insights
+- **Binary rewards preferred**: Strict success/failure signals yield most stable optimization for GRPO.
+- **SFT for warm-starting RL**: High-quality demonstrations teach format/template, then RL for scaling reasoning.
+- **Reward profiling**: Before training, run rollouts across models to confirm reward signal works.
+- **Verification logic**: Prefer binary over partial credit. State matching > trajectory matching.
+
+### NVIDIA's Own GRPO Settings (§3.2.5 of paper)
+- 128 prompts/step, **16 generations/prompt**, batch 2048
+- **Max generation length: 49,152 tokens** (we use 512 — appropriate for our shorter puzzles)
+- Router weights frozen during GRPO (already handled in our LoRA config)
+- Pure RL on verifiable math/code tasks
+
+### Fixes Applied
+1. `GRPO_MAX_COMPLETION`: 256 → 512 (fix truncation before `\boxed{}`)
+2. `mask_truncated_completions=True` (exclude truncated completions from loss)
+3. Added post-SFT sanity check cell (generates 3 sample completions, checks `\boxed{}` presence)
+4. Added `completions/clipped_ratio` and `completions/mean_length` to GRPO logging
